@@ -1,0 +1,60 @@
+# ── Sensitive: credentials, tokens, session artifacts ──────────────────────────
+email.txt
+email*.txt
+!email.txt.example
+refresh_tokens.txt
+hybrid_links.txt
+*.har
+run.log
+*.log
+list.txt
+Test
+
+# ── Browser artifacts (may contain PII / form data) ────────────────────────────
+screenshots/
+*.png
+*.jpg
+*.jpeg
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ── Virtual envs ───────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE / tooling ──────────────────────────────────────────────────────────────
+.opencode-jce/
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Secrets / env ──────────────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
