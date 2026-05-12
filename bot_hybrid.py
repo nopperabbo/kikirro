@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
+import json
 import os
+import random
 import sys
 import time
 import traceback
@@ -89,6 +92,10 @@ CONCURRENCY = _env_int("KIRO_CONCURRENCY", 1)
 
 # Always request English UI so selectors stay predictable across regions.
 # Users in non-EN locales should leave these as-is — Kiro & Google both honour them.
+# These three are retained as soft global overrides: if profiles.json is
+# missing/empty, pick_profile() returns _DEFAULT_PROFILE — at which point
+# these env vars still don't do anything because _DEFAULT_PROFILE has its
+# own locale/tz. They're kept for backwards compatibility only.
 LOCALE = os.environ.get("KIRO_LOCALE", "en-US")
 TIMEZONE_ID = os.environ.get("KIRO_TIMEZONE", "America/Los_Angeles")
 ACCEPT_LANGUAGE = os.environ.get("KIRO_ACCEPT_LANG", "en-US,en;q=0.9")
@@ -111,7 +118,7 @@ GOOGLE_BLOCK_PHRASES = [
     "Tidak dapat menemukan Akun Google Anda",
 ]
 
-CHROMIUM_ARGS = [
+CHROMIUM_ARGS_BASE = [
     "--disable-blink-features=AutomationControlled",
     "--disable-features=IsolateOrigins,site-per-process,AsyncDns",
     "--no-sandbox",
@@ -123,14 +130,89 @@ CHROMIUM_ARGS = [
     "--password-store=basic",
     "--disable-ipv6",
     "--dns-prefetch-disable",
-    f"--lang={LOCALE}",
 ]
-USER_AGENT = os.environ.get(
-    "KIRO_USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/147.0.0.0 Safari/537.36",
-)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# PROFILES — 100 diverse browser fingerprints to rotate per account.
+#   KIRO_PROFILES_FILE      override path (default: ./profiles.json)
+#   KIRO_PROFILE_MODE       hash | random | fixed:<id>   (default: hash)
+#   KIRO_FORCE_PROFILE_ID   shortcut for mode=fixed:<id>
+# If profiles.json is missing, we fall back to a single macOS/en-US default so
+# the bot still works — but you lose the per-account rotation benefit.
+# ──────────────────────────────────────────────────────────────────────────────
+
+PROFILES_FILE = Path(os.environ.get("KIRO_PROFILES_FILE") or (BASE_DIR / "profiles.json"))
+PROFILE_MODE = os.environ.get("KIRO_PROFILE_MODE", "hash").strip().lower()
+FORCE_PROFILE_ID = os.environ.get("KIRO_FORCE_PROFILE_ID", "").strip()
+
+_DEFAULT_PROFILE: dict[str, Any] = {
+    "id": "default-mac-en-US",
+    "platform": "macOS",
+    "user_agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/147.0.0.0 Safari/537.36"
+    ),
+    "sec_ch_ua": '"Not=A?Brand";v="99", "Chromium";v="147", "Google Chrome";v="147"',
+    "sec_ch_ua_platform": '"macOS"',
+    "sec_ch_ua_mobile": "?0",
+    "viewport": {"width": 1366, "height": 820},
+    "locale": "en-US",
+    "timezone_id": "America/Los_Angeles",
+    "accept_language": "en-US,en;q=0.9",
+}
+
+
+def _load_profiles() -> list[dict[str, Any]]:
+    if not PROFILES_FILE.exists():
+        return []
+    try:
+        raw = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"⚠️  failed to parse {PROFILES_FILE.name}: {e} — using default profile", flush=True)
+        return []
+    if isinstance(raw, dict) and "profiles" in raw:
+        profs = raw["profiles"]
+    elif isinstance(raw, list):
+        profs = raw
+    else:
+        return []
+    return [p for p in profs if isinstance(p, dict) and p.get("id")]
+
+
+_PROFILES: list[dict[str, Any]] = _load_profiles()
+
+
+def pick_profile(email: str) -> dict[str, Any]:
+    """Pick a browser profile for the given email.
+
+    Modes:
+      hash     → stable mapping: same email always gets the same profile, so
+                 retries don't suddenly "teleport" to a different country.
+      random   → independent of email. Useful for stress-testing fingerprints.
+      fixed:ID → always return the profile with that id. Debug / reproduction.
+
+    Falls back to a built-in default profile if profiles.json is absent/empty.
+    """
+    if FORCE_PROFILE_ID:
+        for p in _PROFILES:
+            if p.get("id") == FORCE_PROFILE_ID:
+                return p
+        return _DEFAULT_PROFILE
+    if PROFILE_MODE.startswith("fixed:"):
+        wanted = PROFILE_MODE.split(":", 1)[1]
+        for p in _PROFILES:
+            if p.get("id") == wanted:
+                return p
+        return _DEFAULT_PROFILE
+    if not _PROFILES:
+        return _DEFAULT_PROFILE
+    if PROFILE_MODE == "random":
+        return random.choice(_PROFILES)
+    # default: hash
+    digest = hashlib.sha256(email.lower().encode("utf-8")).digest()
+    idx = int.from_bytes(digest[:8], "big") % len(_PROFILES)
+    return _PROFILES[idx]
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DATA
@@ -147,6 +229,7 @@ class KiroSession:
     user_id: str
     visitor_id: str
     cookies: dict[str, str]
+    profile: dict[str, Any]
 
 
 @dataclass
@@ -247,17 +330,29 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
     #                      because Kiro does NOT put refreshToken in the response body.
     captured: dict[str, Any] = {"exchange": None, "refresh_token": None}
 
+    profile = pick_profile(email)
+    log(
+        email,
+        f"🎭 profile={profile.get('id')}  platform={profile.get('platform')}  "
+        f"locale={profile.get('locale')}  tz={profile.get('timezone_id')}  "
+        f"viewport={profile.get('viewport', {}).get('width')}x{profile.get('viewport', {}).get('height')}",
+    )
+
+    chromium_args = list(CHROMIUM_ARGS_BASE) + [f"--lang={profile.get('locale', 'en-US')}"]
+
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(
             headless=HEADLESS,
-            args=CHROMIUM_ARGS,
+            args=chromium_args,
         )
         context: BrowserContext = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 820},
-            locale=LOCALE,
-            timezone_id=TIMEZONE_ID,
-            extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
+            user_agent=profile.get("user_agent", _DEFAULT_PROFILE["user_agent"]),
+            viewport=profile.get("viewport", _DEFAULT_PROFILE["viewport"]),
+            locale=profile.get("locale", "en-US"),
+            timezone_id=profile.get("timezone_id", "America/Los_Angeles"),
+            extra_http_headers={
+                "Accept-Language": profile.get("accept_language", "en-US,en;q=0.9"),
+            },
         )
 
         page: Page = await context.new_page()
@@ -428,6 +523,7 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
                 user_id=user_id,
                 visitor_id=visitor_id,
                 cookies=cookies,
+                profile=profile,
             )
 
         except PlaywrightTimeoutError as e:
@@ -582,7 +678,20 @@ async def _click_consent_if_present(page: Page) -> None:
 
 
 def _build_kiro_headers(session: KiroSession) -> dict[str, str]:
-    """Exactly what the browser sends — smithy-protocol + rpc-v2-cbor is non-negotiable."""
+    """Exactly what the browser sends — smithy-protocol + rpc-v2-cbor is non-negotiable.
+
+    UA + Accept-Language mirror the harvest profile so Phase 2's API call looks
+    like it's from the same browser that just did the OAuth flow. Mismatched
+    UA between phases is the fastest way to get a soft block from Kiro.
+    """
+    profile = session.profile or _DEFAULT_PROFILE
+    platform = profile.get("platform", "macOS")
+    ua_platform_hint = {
+        "Windows": "Windows",
+        "macOS": "macOS",
+        "Linux": "Linux",
+        "Chrome OS": "CrOS",
+    }.get(platform, "macOS")
     return {
         "Host": "app.kiro.dev",
         "accept": "application/cbor",
@@ -592,12 +701,18 @@ def _build_kiro_headers(session: KiroSession) -> dict[str, str]:
         "x-csrf-token": session.csrf_token,
         "x-kiro-userid": session.user_id,
         "x-kiro-visitorid": session.visitor_id,
-        "x-amz-user-agent": "aws-sdk-js/1.0.0 ua/2.1 os/macOS lang/js md/browser#Chromium_147 m/N,M,E",
+        "x-amz-user-agent": (
+            f"aws-sdk-js/1.0.0 ua/2.1 os/{ua_platform_hint} "
+            f"lang/js md/browser#Chromium_147 m/N,M,E"
+        ),
         "amz-sdk-request": "attempt=1; max=1",
         "origin": "https://app.kiro.dev",
         "referer": "https://app.kiro.dev/account/usage",
-        "user-agent": USER_AGENT,
-        "accept-language": "en-US,en;q=0.9",
+        "user-agent": profile.get("user_agent", _DEFAULT_PROFILE["user_agent"]),
+        "accept-language": profile.get("accept_language", "en-US,en;q=0.9"),
+        "sec-ch-ua": profile.get("sec_ch_ua", _DEFAULT_PROFILE["sec_ch_ua"]),
+        "sec-ch-ua-mobile": profile.get("sec_ch_ua_mobile", "?0"),
+        "sec-ch-ua-platform": profile.get("sec_ch_ua_platform", '"macOS"'),
     }
 
 

@@ -32,6 +32,43 @@ python3 bot_hybrid.py
 | `refresh_tokens.txt` | `email:refresh_token` for each account that completes phase 1 |
 | `screenshots/` | Auto-snapshot on every failure path for debugging |
 
+## Profile Rotation
+
+The bot ships with `profiles.json` — **100 diverse browser fingerprints** (UA, platform, viewport, locale, timezone, Sec-CH-UA-Platform) with a realistic distribution:
+
+| Locale | Count |    | Platform | Share |
+|---|---:|---|---|---:|
+| en-US | 40 |   | Windows  | 55% |
+| en-GB | 15 |   | macOS    | 24% |
+| en-CA | 10 |   | Linux    | 18% |
+| en-AU | 10 |   | Chrome OS | 3% |
+| de-DE | 5  |
+| fr-FR | 5  |
+| nl-NL | 5  |
+| ja-JP | 3  |
+| es-ES | 3  |
+| en-SG | 2  |
+| pt-BR | 2  |
+
+Each account gets a profile via **stable hash** of the email — same account always
+gets the same fingerprint across runs, so retries don't "teleport" to a different
+country (which itself is a red flag to Google).
+
+Phase 2's Stripe API call reuses the same UA / Accept-Language / Sec-CH-UA-Platform
+as Phase 1, so Kiro sees a consistent browser identity across the whole flow.
+
+**Rotation modes (`KIRO_PROFILE_MODE`):**
+
+- `hash` (default) — deterministic email → profile map
+- `random` — fresh pick per run, useful for stress-testing
+- `fixed:<id>` — always use the named profile (debug / repro)
+
+Or use `KIRO_FORCE_PROFILE_ID=us-win-03` as a shortcut.
+
+**Regenerate the pool:** delete `profiles.json` and the bot falls back to a single
+default profile. To re-seed 100, re-run the generator embedded in your shell
+history, or edit `profiles.json` by hand — it's plain JSON with a simple schema.
+
 ## Config
 
 All settings are overridable via environment variables. No need to edit the source.
@@ -39,6 +76,9 @@ All settings are overridable via environment variables. No need to edit the sour
 | Env var | Default | Purpose |
 |---|---|---|
 | `KIRO_PLAN` | `PRO` | `PRO` / `PRO_PLUS` / `POWER` (or full `Q_DEVELOPER_STANDALONE_*` string) |
+| `KIRO_PROFILES_FILE` | `./profiles.json` | Path to the 100-profile fingerprint pool |
+| `KIRO_PROFILE_MODE` | `hash` | `hash` / `random` / `fixed:<id>` |
+| `KIRO_FORCE_PROFILE_ID` | _(unset)_ | Shortcut: force a specific profile for all accounts |
 | `KIRO_HEADLESS` | `true` | Set to `false` to watch the browser — essential for debugging |
 | `KIRO_CONCURRENCY` | `1` | Parallel accounts. Raise cautiously, Google rate-limits hard |
 | `KIRO_NAV_TIMEOUT_MS` | `60000` | Hard cap on any navigation. Bump on slow networks |
