@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 import sys
 import time
 import traceback
@@ -38,32 +39,59 @@ from patchright.async_api import (
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG — all values overridable via env vars so users don't need to edit code.
 # ──────────────────────────────────────────────────────────────────────────────
 
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "").strip() or default)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.environ.get(name, "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 BASE_DIR = Path(__file__).resolve().parent
-INPUT_FILE = BASE_DIR / "email.txt"
-OUTPUT_FILE = BASE_DIR / "hybrid_links.txt"
-REFRESH_TOKEN_FILE = BASE_DIR / "refresh_tokens.txt"
-SCREENSHOT_DIR = BASE_DIR / "screenshots"
+INPUT_FILE = Path(os.environ.get("KIRO_EMAIL_FILE") or (BASE_DIR / "email.txt"))
+OUTPUT_FILE = Path(os.environ.get("KIRO_OUTPUT_FILE") or (BASE_DIR / "hybrid_links.txt"))
+REFRESH_TOKEN_FILE = Path(os.environ.get("KIRO_REFRESH_FILE") or (BASE_DIR / "refresh_tokens.txt"))
+SCREENSHOT_DIR = Path(os.environ.get("KIRO_SCREENSHOT_DIR") or (BASE_DIR / "screenshots"))
 
 KIRO_LOGIN_URL = "https://app.kiro.dev/"
 KIRO_API_BASE = "https://app.kiro.dev/service/KiroWebPortalService/operation"
 KIRO_SUB_ENDPOINT = f"{KIRO_API_BASE}/GenerateSubscriptionManagementUrl"
 
-# Plan to subscribe to — change if you want PRO_PLUS / POWER.
-#   KIRO_PRO       -> Q_DEVELOPER_STANDALONE_PRO        ($20/mo)
-#   KIRO_PRO_PLUS  -> Q_DEVELOPER_STANDALONE_PRO_PLUS   ($40/mo)
-#   KIRO_POWER     -> Q_DEVELOPER_STANDALONE_POWER      ($200/mo)
-Q_SUBSCRIPTION_TYPE = "Q_DEVELOPER_STANDALONE_PRO"
+# Plan — env KIRO_PLAN=PRO|PRO_PLUS|POWER overrides.
+_PLAN_ALIASES = {
+    "PRO": "Q_DEVELOPER_STANDALONE_PRO",
+    "PRO_PLUS": "Q_DEVELOPER_STANDALONE_PRO_PLUS",
+    "POWER": "Q_DEVELOPER_STANDALONE_POWER",
+}
+_plan_env = os.environ.get("KIRO_PLAN", "PRO").upper().strip()
+Q_SUBSCRIPTION_TYPE = _PLAN_ALIASES.get(_plan_env, _plan_env) or "Q_DEVELOPER_STANDALONE_PRO"
 
-# Login timing — tight enough to catch tokens fast, loose enough to ride out slow Google SSO.
-NAV_TIMEOUT_MS = 45_000
-STEP_TIMEOUT_MS = 25_000
-TOKEN_WAIT_SECONDS = 60  # How long we wait for the ExchangeToken response after consent.
+NAV_TIMEOUT_MS = _env_int("KIRO_NAV_TIMEOUT_MS", 60_000)
+STEP_TIMEOUT_MS = _env_int("KIRO_STEP_TIMEOUT_MS", 30_000)
+TOKEN_WAIT_SECONDS = _env_int("KIRO_TOKEN_WAIT_SECONDS", 90)
+BUTTON_WAIT_SECONDS = _env_int("KIRO_BUTTON_WAIT_SECONDS", 30)
+PHASE1_RETRIES = _env_int("KIRO_PHASE1_RETRIES", 1)
 
-# Concurrency — Google will block hard if you spam. Keep low.
-CONCURRENCY = 1
+HEADLESS = _env_bool("KIRO_HEADLESS", True)
+CONCURRENCY = _env_int("KIRO_CONCURRENCY", 1)
+
+# Always request English UI so selectors stay predictable across regions.
+# Users in non-EN locales should leave these as-is — Kiro & Google both honour them.
+LOCALE = os.environ.get("KIRO_LOCALE", "en-US")
+TIMEZONE_ID = os.environ.get("KIRO_TIMEZONE", "America/Los_Angeles")
+ACCEPT_LANGUAGE = os.environ.get("KIRO_ACCEPT_LANG", "en-US,en;q=0.9")
 
 # Google / Cognito red-flag phrases that mean "stop, this account is cooked".
 GOOGLE_BLOCK_PHRASES = [
@@ -71,7 +99,6 @@ GOOGLE_BLOCK_PHRASES = [
     "Wrong password",
     "Couldn't sign you in",
     "This browser or app may not be secure",
-    "Try again",
     "Confirm you're not a robot",
     "Couldn't find your Google Account",
     "Enter a valid email",
@@ -80,6 +107,8 @@ GOOGLE_BLOCK_PHRASES = [
     "unusual activity",
     "temporarily disabled",
     "account has been disabled",
+    "Akun Anda dinonaktifkan",
+    "Tidak dapat menemukan Akun Google Anda",
 ]
 
 CHROMIUM_ARGS = [
@@ -94,11 +123,13 @@ CHROMIUM_ARGS = [
     "--password-store=basic",
     "--disable-ipv6",
     "--dns-prefetch-disable",
+    f"--lang={LOCALE}",
 ]
-USER_AGENT = (
+USER_AGENT = os.environ.get(
+    "KIRO_USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/147.0.0.0 Safari/537.36"
+    "Chrome/147.0.0.0 Safari/537.36",
 )
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -218,14 +249,15 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
 
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(
-            headless=True,
+            headless=HEADLESS,
             args=CHROMIUM_ARGS,
         )
         context: BrowserContext = await browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1366, "height": 820},
-            locale="en-US",
-            timezone_id="America/Los_Angeles",
+            locale=LOCALE,
+            timezone_id=TIMEZONE_ID,
+            extra_http_headers={"Accept-Language": ACCEPT_LANGUAGE},
         )
 
         page: Page = await context.new_page()
@@ -274,19 +306,34 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
             # ── Step 1: open Kiro app root. It redirects to login automatically. ──
             log(email, "→ opening https://app.kiro.dev/")
             await page.goto(KIRO_LOGIN_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(800)
+            # Nudge the SPA: wait for network idle OR a reasonable cap, whichever
+            # comes first. Fixed sleeps break on slow connections, so we race.
+            try:
+                await page.wait_for_load_state("networkidle", timeout=8_000)
+            except Exception:
+                pass
+            await _dismiss_cookie_banner(page)
 
             # ── Step 2: click "Continue with Google" (or equivalent). ──
-            log(email, "→ looking for Google sign-in button")
-            google_btn = await _find_google_button(page)
+            log(email, f"→ looking for Google sign-in button (up to {BUTTON_WAIT_SECONDS}s)")
+            google_btn = await _find_google_button(page, max_wait_s=BUTTON_WAIT_SECONDS)
             if google_btn is None:
-                # Already logged in? Some cached flows jump straight to dashboard.
-                if "account" in page.url:
+                if "account" in page.url and "signin" not in page.url:
                     log(email, "seems already signed in — reading cookies")
                 else:
-                    await page.screenshot(
-                        path=str(SCREENSHOT_DIR / f"no_google_btn_{safe_slug(email)}.png")
+                    await _safe_screenshot(
+                        page, SCREENSHOT_DIR / f"no_google_btn_{safe_slug(email)}.png"
                     )
+                    # Dump page title + visible text snippet to make remote debugging sane.
+                    try:
+                        title = await page.title()
+                        snippet = await page.evaluate(
+                            "() => (document.body ? document.body.innerText : '').slice(0, 300)"
+                        )
+                        log(email, f"   page title: {title!r}")
+                        log(email, f"   page text : {snippet!r}")
+                    except Exception:
+                        pass
                     raise RuntimeError("Google sign-in button not found")
             else:
                 async with page.expect_navigation(
@@ -335,9 +382,9 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
                     await _click_consent_if_present(page)
 
             if not captured["exchange"]:
-                await page.screenshot(
-                    path=str(SCREENSHOT_DIR / f"no_token_{safe_slug(email)}.png")
-                )
+                await _safe_screenshot(
+                                page, SCREENSHOT_DIR / f"no_token_{safe_slug(email)}.png"
+                            )
                 raise RuntimeError("ExchangeToken never fired within timeout")
 
             exch = captured["exchange"]
@@ -384,20 +431,20 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
             )
 
         except PlaywrightTimeoutError as e:
-            await page.screenshot(
-                path=str(SCREENSHOT_DIR / f"timeout_{safe_slug(email)}.png")
-            )
+            await _safe_screenshot(
+                            page, SCREENSHOT_DIR / f"timeout_{safe_slug(email)}.png"
+                        )
             raise RuntimeError(f"Playwright timeout: {e}") from e
         except GoogleBlockedError as e:
-            await page.screenshot(
-                path=str(SCREENSHOT_DIR / f"google_blocked_{safe_slug(email)}.png")
-            )
+            await _safe_screenshot(
+                            page, SCREENSHOT_DIR / f"google_blocked_{safe_slug(email)}.png"
+                        )
             raise
         except Exception:
             try:
-                await page.screenshot(
-                    path=str(SCREENSHOT_DIR / f"error_{safe_slug(email)}.png")
-                )
+                await _safe_screenshot(
+                                page, SCREENSHOT_DIR / f"error_{safe_slug(email)}.png"
+                            )
             except Exception:
                 pass
             raise
@@ -413,48 +460,119 @@ async def harvest_tokens(email: str, password: str) -> KiroSession:
                 pass
 
 
-async def _find_google_button(page: Page):
-    """Try a handful of selector strategies — Kiro's UI changes occasionally."""
+async def _safe_screenshot(page: Page, path: Path) -> None:
+    """Screenshot with a hard 5s cap. Never raises, never hangs.
+
+    The default page.screenshot() inherits STEP_TIMEOUT_MS (30s). When the page
+    is wedged (common failure mode), the screenshot itself hangs, so the error
+    handler ends up taking 25–30s on top of the original failure — giving
+    misleading double-timeout log output. Capping to 5s keeps failures fast.
+    """
+    try:
+        await asyncio.wait_for(
+            page.screenshot(path=str(path), timeout=5_000),
+            timeout=6.0,
+        )
+    except Exception:
+        pass
+
+
+async def _dismiss_cookie_banner(page: Page) -> None:
+    """Some regions (EU/UK) get a GDPR consent banner that overlays the login button."""
+    for sel in (
+        'button:has-text("Accept all")',
+        'button:has-text("Accept All")',
+        'button:has-text("I agree")',
+        'button:has-text("Got it")',
+        'button:has-text("Setuju")',
+        'button:has-text("Terima semua")',
+        '[aria-label*="accept" i]',
+        '[id*="cookie" i] button',
+        '[class*="cookie" i] button:has-text("Accept")',
+    ):
+        try:
+            btn = page.locator(sel).first
+            if await btn.is_visible(timeout=500):
+                await btn.click(timeout=2_000)
+                await page.wait_for_timeout(400)
+                return
+        except Exception:
+            continue
+
+
+async def _find_google_button(page: Page, max_wait_s: int = 30):
+    """Poll for the Google sign-in button, tolerant of slow React hydration.
+
+    Kiro is a React SPA — the button is not in the initial HTML, it's injected
+    after the JS bundle executes. On slow connections this can take 10–20s,
+    which is why a fixed wait_for_timeout(800) + single selector lookup fails
+    intermittently. We poll for up to max_wait_s against a wide selector set
+    covering EN / ID / generic fallbacks.
+    """
     selectors = [
         'button:has-text("Continue with Google")',
         'button:has-text("Sign in with Google")',
+        'button:has-text("Log in with Google")',
         'a:has-text("Continue with Google")',
         'a:has-text("Sign in with Google")',
-        '[data-testid*="google"]',
+        'button:has-text("Lanjutkan dengan Google")',
+        'button:has-text("Masuk dengan Google")',
+        'button:has-text("Se connecter avec Google")',
+        'button:has-text("Iniciar sesión con Google")',
+        '[data-testid*="google" i]',
+        '[data-test*="google" i]',
         '[aria-label*="Google" i]',
         'button >> text=/google/i',
+        'a >> text=/google/i',
+        '[role="button"] >> text=/google/i',
     ]
-    for sel in selectors:
-        try:
-            loc = page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=4_000)
-            return loc
-        except Exception:
-            continue
+    deadline = time.monotonic() + max_wait_s
+    attempt = 0
+    while time.monotonic() < deadline:
+        attempt += 1
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=300):
+                    return loc
+            except Exception:
+                continue
+        await _dismiss_cookie_banner(page)
+        await page.wait_for_timeout(800)
     return None
 
 
 async def _click_consent_if_present(page: Page) -> None:
-    """Google shows a 'Continue' / 'Allow' screen on first-time OAuth grants."""
+    """Google shows a 'Continue' / 'Allow' screen on first-time OAuth grants.
+
+    Covers EN / ID / ES / FR text variants since Google serves localised consent
+    pages based on the account's preferred language, which ignores our UA hint.
+    """
     for _ in range(3):
         if "accounts.google.com" not in page.url:
             return
+        clicked = False
         for sel in [
             'button:has-text("Continue")',
             'button:has-text("Allow")',
             'button:has-text("Lanjutkan")',
             'button:has-text("Izinkan")',
+            'button:has-text("Continuar")',
+            'button:has-text("Permitir")',
+            'button:has-text("Autoriser")',
             '[role="button"]:has-text("Continue")',
+            '[role="button"]:has-text("Lanjutkan")',
         ]:
             try:
                 btn = page.locator(sel).first
-                if await btn.is_visible(timeout=1_500):
-                    await btn.click()
+                if await btn.is_visible(timeout=1_000):
+                    await btn.click(timeout=3_000)
                     await page.wait_for_timeout(1_200)
+                    clicked = True
                     break
             except Exception:
                 continue
-        else:
+        if not clicked:
             return
 
 
@@ -562,27 +680,59 @@ def _classify_error(exc: BaseException) -> str:
     return f"ERROR_{msg}"
 
 
+_RETRYABLE_PHASE1_TAGS = (
+    "ERROR_PlaywrightTimeout",
+    "ERROR_OuterTimeout",
+    "ERROR_Google_sign-in_button_not_found",
+    "ERROR_ExchangeToken_never_fired_within_timeout",
+    "ERROR_missing_identity_parts",
+)
+
+
+def _is_retryable_phase1(tag: str) -> bool:
+    """Transient failures worth retrying once. Hard failures (wrong password,
+    Google blocked, account cooked) are NOT retried — they'll just waste time.
+    """
+    if tag.startswith("ERROR_GoogleBlocked"):
+        return False
+    return any(tag.startswith(t) for t in _RETRYABLE_PHASE1_TAGS)
+
+
+async def _run_phase1(email: str, password: str) -> KiroSession:
+    return await asyncio.wait_for(
+        harvest_tokens(email, password),
+        timeout=NAV_TIMEOUT_MS / 1000 + TOKEN_WAIT_SECONDS + 30,
+    )
+
+
 async def process_account(email: str, password: str) -> AccountResult:
     """Run both phases for one account. NEVER re-raises — always returns a result."""
-    try:
-        # PHASE 1 — Token Harvester
-        session = await asyncio.wait_for(
-            harvest_tokens(email, password),
-            timeout=NAV_TIMEOUT_MS / 1000 + TOKEN_WAIT_SECONDS + 30,
-        )
-        if session.refresh_token:
-            try:
-                with REFRESH_TOKEN_FILE.open("a", encoding="utf-8") as f:
-                    f.write(f"{email}:{session.refresh_token}\n")
-            except Exception as e:
-                log(email, f"⚠️ failed to save refresh token: {e}")
-    except asyncio.TimeoutError:
-        log(email, "✗ outer timeout during harvest")
-        return AccountResult(email, "ERROR_OuterTimeout", "ERROR_OuterTimeout_phase1")
-    except Exception as e:
-        log(email, f"✗ harvest failed: {e.__class__.__name__}: {e}")
-        tag = _classify_error(e)
-        return AccountResult(email, tag, tag)
+    session: Optional[KiroSession] = None
+    last_tag = "ERROR_Unknown"
+    for attempt in range(1, PHASE1_RETRIES + 2):
+        try:
+            session = await _run_phase1(email, password)
+            if session.refresh_token:
+                try:
+                    with REFRESH_TOKEN_FILE.open("a", encoding="utf-8") as f:
+                        f.write(f"{email}:{session.refresh_token}\n")
+                except Exception as e:
+                    log(email, f"⚠️ failed to save refresh token: {e}")
+            break
+        except asyncio.TimeoutError:
+            last_tag = "ERROR_OuterTimeout"
+            log(email, f"✗ outer timeout during harvest (attempt {attempt})")
+        except Exception as e:
+            last_tag = _classify_error(e)
+            log(email, f"✗ harvest failed (attempt {attempt}): {e.__class__.__name__}: {e}")
+        if attempt <= PHASE1_RETRIES and _is_retryable_phase1(last_tag):
+            log(email, f"↻ retrying phase 1 ({attempt}/{PHASE1_RETRIES})…")
+            await asyncio.sleep(2.0)
+            continue
+        return AccountResult(email, last_tag, last_tag)
+
+    if session is None:
+        return AccountResult(email, last_tag, last_tag)
 
     # PHASE 2 — Stripe Link Generator
     try:
